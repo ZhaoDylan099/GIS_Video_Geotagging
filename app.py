@@ -1,6 +1,12 @@
 import panel as pn
 import pandas as pd
 import ipyleaflet as ipyl
+import sounddevice as sd 
+import sys
+import numpy as np
+import wavio as wv
+
+
 
 VIDEO_URL = "http://localhost/newburgheights_dash_video.mp4"
 CSV_FILE  = "newburgheights_dash_video_gps.csv"
@@ -10,6 +16,18 @@ TIME_COL = "media time"
 LAT_COL  = "latitude"
 LON_COL  = "longitude"
 ZOOM_START = 15
+
+
+audio_buffer = []
+samplerate = 44100
+channels = 1
+dtype = np.float32
+
+# May differ between devices
+sd.default.device = (2, 3)
+
+
+
 
 pn.extension('ipywidgets', design='material')
 
@@ -188,6 +206,58 @@ def clear_search(event):
         m.remove_layer(layer)
 
 clear_plot_button.on_click(clear_search)
+
+# ---------- Audio Recording ---------
+
+
+recording_status = pn.pane.Markdown("🔴 **Not Recording**")
+record_button = pn.widgets.Button(name= 'Record', button_type = "primary")
+stop_button = pn.widgets.Button(name="Stop Recording", button_type="danger", disabled=True)
+playback = pn.pane.Audio(None, name='Audio')
+
+
+stream = None
+
+
+
+def callback(indata, frames, time, status):
+    
+    if status:
+        print(status, file=sys.stderr)
+
+    audio_buffer.append(indata.copy())  # store incoming audio chunk
+
+
+def record_audio(event):
+    global stream, audio_buffer
+    audio_buffer = []
+    stream = sd.InputStream(samplerate=samplerate, channels=channels, dtype=dtype, callback=callback)
+
+    stream.start()
+    recording_status.object = "🟢 **Recording...**"
+    record_button.disabled = True
+    stop_button.disabled = False
+
+
+def stop_recording(event):
+    global stream, audio_buffer
+
+    stream.stop()
+    stream.close()
+
+    audio = np.concatenate(audio_buffer, axis=0)
+    recording_status.object = "🔴 **Stopped Recording**"
+
+    stop_button.disabled = True
+    record_button.disabled = False
+    
+    wv.write("recording.wav", audio, samplerate, sampwidth=2)
+    playback.object = "recording.wav"
+
+record_button.on_click(record_audio)
+stop_button.on_click(stop_recording)
+
+
 # ---------------- UI ----------------
 
 left  = pn.Column("## Video Display",
@@ -200,7 +270,11 @@ left  = pn.Column("## Video Display",
 
 
 right = pn.Column("## Live GPS Map",
-                  map_pane)
+                  map_pane,
+                  "## Add Commentary",
+                  pn.Row(record_button, stop_button),
+                  recording_status,
+                  playback)
 
 pn.Column("# Newburgh Heights Dash GPS Sync",
           pn.Row(left, right)).servable()
