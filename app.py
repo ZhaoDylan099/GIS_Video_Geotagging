@@ -5,8 +5,8 @@ import sounddevice as sd
 import sys
 import numpy as np
 import wavio as wv
-
-
+import psycopg2
+import whisper
 
 VIDEO_URL = "http://localhost/newburgheights_dash_video.mp4"
 CSV_FILE  = "newburgheights_dash_video_gps.csv"
@@ -24,9 +24,11 @@ channels = 1
 dtype = np.float32
 
 # May differ between devices
-sd.default.device = (2, 3)
+sd.default.device = (1, 2)
+print(sd.query_devices())
 
-
+conn = psycopg2.connect("dbname=GIS_Video_Geotagging user=postgres password=123123 host=localhost")
+cur = conn.cursor()
 
 
 pn.extension('ipywidgets', design='material')
@@ -210,15 +212,18 @@ clear_plot_button.on_click(clear_search)
 # ---------- Audio Recording ---------
 
 
-recording_status = pn.pane.Markdown("🔴 **Not Recording**")
+recording_status = pn.pane.Markdown("### 🔴 **Not Recording**")
 record_button = pn.widgets.Button(name= 'Record', button_type = "primary")
 stop_button = pn.widgets.Button(name="Stop Recording", button_type="danger", disabled=True)
 playback = pn.pane.Audio(None, name='Audio')
-
+record_id = None
+save_recording = pn.widgets.Button(name="Save Recording", button_type = "primary", disabled = True)
+audio_retrieval = pn.widgets.Button(name="Retrieve Audio", button_type = "primary")
+audio_id_input = pn.widgets.TextInput(name="Audio ID", placeholder = "ID", width = 300)
 
 stream = None
 
-
+db_audio = pd.DataFrame(columns=["ID","Timestamp", "Transcript"])
 
 def callback(indata, frames, time, status):
     
@@ -231,12 +236,14 @@ def callback(indata, frames, time, status):
 def record_audio(event):
     global stream, audio_buffer
     audio_buffer = []
+    playback.object = None
     stream = sd.InputStream(samplerate=samplerate, channels=channels, dtype=dtype, callback=callback)
 
     stream.start()
-    recording_status.object = "🟢 **Recording...**"
+    recording_status.object = "### 🟢 **Recording...**"
     record_button.disabled = True
     stop_button.disabled = False
+    save_recording.disabled = True
 
 
 def stop_recording(event):
@@ -246,16 +253,69 @@ def stop_recording(event):
     stream.close()
 
     audio = np.concatenate(audio_buffer, axis=0)
-    recording_status.object = "🔴 **Stopped Recording**"
+    recording_status.object = "### 🔴 **Stopped Recording**"
 
     stop_button.disabled = True
     record_button.disabled = False
+    save_recording.disabled = False
     
     wv.write("recording.wav", audio, samplerate, sampwidth=2)
     playback.object = "recording.wav"
 
 record_button.on_click(record_audio)
 stop_button.on_click(stop_recording)
+
+
+def audio_to_db(event):
+
+    sql = """ INSERT INTO recordings (time_s, audio, sample_rate, channels)  
+    VALUES (%s, %s, %s, %s) 
+    RETURNING audioID; """
+    
+
+    with open("recording.wav", "rb") as f:
+        wav_bytes = f.read()
+
+    try:
+        cur.execute(
+            sql,
+            (round(video_pane.time), psycopg2.Binary(wav_bytes), samplerate, channels)
+        )
+
+        record_id = cur.fetchone()[0]
+
+        conn.commit()
+
+
+    except:
+        recording_status.object = "### ❌ Recording failed to Save"
+        return
+
+    recording_status.object = f"### ✅ Recording Saved with ID: {record_id}"
+
+def retrieve_audio(event):
+
+    sql = """ SELECT audio FROM recordings
+                WHERE audioID = %s"""
+    
+    id = audio_id_input.value
+
+    try:
+        cur.execute(sql, (id,))
+        wav_bytes = cur.fetchone()[0]
+
+        with open("recording.wav", "wb") as f:
+            f.write(wav_bytes)
+
+        recording_status.object = "### ✅ Audio Retrieved"
+        playback.object = None
+        playback.object = "recording.wav"
+    except TypeError:
+        recording_status.object = "### ❌ Audio Retrieval Failed: ID not found"
+
+
+save_recording.on_click(audio_to_db)
+audio_retrieval.on_click(retrieve_audio)
 
 
 # ---------------- UI ----------------
@@ -272,9 +332,11 @@ left  = pn.Column("## Video Display",
 right = pn.Column("## Live GPS Map",
                   map_pane,
                   "## Add Commentary",
-                  pn.Row(record_button, stop_button),
+                  pn.Row(record_button, stop_button, save_recording),
                   recording_status,
-                  playback)
+                  playback,
+                  pn.Row(audio_retrieval, audio_id_input)
+                  )
 
 pn.Column("# Newburgh Heights Dash GPS Sync",
           pn.Row(left, right)).servable()
