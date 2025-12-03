@@ -6,7 +6,8 @@ import sys
 import numpy as np
 import wavio as wv
 import psycopg2
-import whisper
+import whisper 
+from sqlalchemy import create_engine
 
 VIDEO_URL = "http://localhost/newburgheights_dash_video.mp4"
 CSV_FILE  = "newburgheights_dash_video_gps.csv"
@@ -27,9 +28,15 @@ dtype = np.float32
 sd.default.device = (1, 2)
 print(sd.query_devices())
 
+# Adjust for your database configurations
 conn = psycopg2.connect("dbname=GIS_Video_Geotagging user=postgres password=123123 host=localhost")
+
 cur = conn.cursor()
 
+engine = create_engine(
+    "postgresql+psycopg2://",
+    creator=lambda: conn
+)
 
 pn.extension('ipywidgets', design='material')
 
@@ -79,7 +86,8 @@ lat, lon = get_current_location()
 
 
 m = ipyl.Map(center=(lat, lon), zoom=ZOOM_START, scroll_wheel_zoom=True)
-
+m.layout.height = "500px"
+m.layout.width = "700px"
 
 marker = ipyl.CircleMarker(location=(lat, lon), radius=7, color="red", fill=True, fill_color="red", fill_opacity=0.7)
 m.add_layer(marker)
@@ -88,7 +96,8 @@ m.add_layer(marker)
 legend = ipyl.LegendControl(
     {
         "GPS Synced Point": "red",
-        "Search Results": "blue",
+        "Original Transcript Search Results": "blue",
+        "Added Transcript Search Results": "green"
     },
     name="Legend",
     position="bottomright"
@@ -160,7 +169,7 @@ def plot_search(event):
 
     for layer in m.layers:
         # keep basemap + the marker we want to keep
-        if isinstance(layer, ipyl.CircleMarker) and layer is not marker:
+        if isinstance(layer, ipyl.CircleMarker) and layer is not marker and hasattr(layer, "original"):
             to_remove.append(layer)
         
     for layer in to_remove:
@@ -188,6 +197,7 @@ def plot_search(event):
                 opacity=0.8,
                 fill_opacity=0.8
             )
+            dot.original = True
 
             m.add_layer(dot)
 
@@ -201,7 +211,7 @@ def clear_search(event):
 
     for layer in m.layers:
         # keep basemap + the marker we want to keep
-        if isinstance(layer, ipyl.CircleMarker) and layer is not marker:
+        if isinstance(layer, ipyl.CircleMarker) and layer is not marker and hasattr(layer, "original"):
             to_remove.append(layer)
         
     for layer in to_remove:
@@ -220,6 +230,25 @@ record_id = None
 save_recording = pn.widgets.Button(name="Save Recording", button_type = "primary", disabled = True)
 audio_retrieval = pn.widgets.Button(name="Retrieve Audio", button_type = "primary")
 audio_id_input = pn.widgets.TextInput(name="Audio ID", placeholder = "ID", width = 300)
+model = whisper.load_model("large") 
+
+
+def reflect_db():
+    sql = """SELECT * FROM recordings"""
+
+    df = pd.read_sql_query(sql, engine)
+
+    df["Timestamp"] = df["time_s"].apply(seconds_to_time)
+    df.rename(columns = {"transcript": "Transcript", "audioid": "ID"}, inplace=True)
+
+    df = df[["ID", "Timestamp", "Transcript"]]
+
+    return df
+
+
+
+new_transcript_df = pn.pane.DataFrame(reflect_db(),
+                    height=300, width=700)
 
 stream = None
 
@@ -244,6 +273,7 @@ def record_audio(event):
     record_button.disabled = True
     stop_button.disabled = False
     save_recording.disabled = True
+    audio_retrieval.disabled = True
 
 
 def stop_recording(event):
@@ -258,6 +288,7 @@ def stop_recording(event):
     stop_button.disabled = True
     record_button.disabled = False
     save_recording.disabled = False
+    audio_retrieval.disabled = False
     
     wv.write("recording.wav", audio, samplerate, sampwidth=2)
     playback.object = "recording.wav"
@@ -265,41 +296,59 @@ def stop_recording(event):
 record_button.on_click(record_audio)
 stop_button.on_click(stop_recording)
 
+def transcribe_audio():
+    result = model.transcribe(playback.object)
+    return result["text"]
+
+
+
+
 
 def audio_to_db(event):
 
-    sql = """ INSERT INTO recordings (time_s, audio, sample_rate, channels)  
-    VALUES (%s, %s, %s, %s) 
+    sql = """ INSERT INTO recordings (time_s, audio, sample_rate, channels, transcript)  
+    VALUES (%s, %s, %s, %s, %s) 
     RETURNING audioID; """
     
 
     with open("recording.wav", "rb") as f:
         wav_bytes = f.read()
 
+
     try:
+
+        recording_status.object = "### Saving Recording..."
+
         cur.execute(
             sql,
-            (round(video_pane.time), psycopg2.Binary(wav_bytes), samplerate, channels)
+            (round(video_pane.time), psycopg2.Binary(wav_bytes), samplerate, channels, transcribe_audio())
         )
 
         record_id = cur.fetchone()[0]
 
         conn.commit()
 
+        
+        new_transcript_df.object = None
+        new_transcript_df.object = reflect_db()
+
+
+        recording_status.object = f"### ✅ Recording Saved with ID: {record_id}"
+        
 
     except:
+        conn.rollback()
         recording_status.object = "### ❌ Recording failed to Save"
-        return
 
-    recording_status.object = f"### ✅ Recording Saved with ID: {record_id}"
+    
 
 def retrieve_audio(event):
 
+    save_recording.disabled = True
     sql = """ SELECT audio FROM recordings
                 WHERE audioID = %s"""
     
     id = audio_id_input.value
-
     try:
         cur.execute(sql, (id,))
         wav_bytes = cur.fetchone()[0]
@@ -310,13 +359,132 @@ def retrieve_audio(event):
         recording_status.object = "### ✅ Audio Retrieved"
         playback.object = None
         playback.object = "recording.wav"
-    except TypeError:
+    except:
+        conn.rollback()
         recording_status.object = "### ❌ Audio Retrieval Failed: ID not found"
 
 
 save_recording.on_click(audio_to_db)
 audio_retrieval.on_click(retrieve_audio)
 
+# ------------ Search Added ----------
+
+search_add_box = pn.widgets.TextInput(name='Search', placeholder='Search...')
+plot_added = pn.widgets.Button(name="Plot Results", button_type="primary")
+clear_added = pn.widgets.Button(name="Clear Plot", button_type = "primary")
+
+def filter_added(event=None):
+    df  = reflect_db().copy()
+    if search_add_box.value is not None:
+
+        t_input = search_add_box.value.strip().lower()
+    
+        df = df[df["Transcript"].str.contains(t_input)]
+
+    new_transcript_df.object = df
+
+pn.state.add_periodic_callback(filter_added, 250)
+search_add_box.param.watch(filter_added, 'value')
+search_add_box.param.watch(filter_added, 'value')
+
+def plot_added_map(event):
+    if not event:
+        return
+    
+    to_remove = []
+
+    for layer in m.layers:
+        # keep basemap + the marker we want to keep
+        if isinstance(layer, ipyl.CircleMarker) and layer is not marker and hasattr(layer, "added"):
+            to_remove.append(layer)
+        
+    for layer in to_remove:
+        m.remove_layer(layer)
+    
+    df = new_transcript_df.object.copy()
+
+
+    df = df[df["Transcript"].str.contains(search_add_box.value)]
+
+    df["time_s"] = df["Timestamp"].apply(time_to_seconds)
+
+    times = df.time_s.tolist()
+
+
+    for i in times:
+        lat = gps[gps["time_seconds"] == i]["latitude"].tolist()
+        lon = gps[gps["time_seconds"] == i]["longitude"].tolist()
+
+        if lat:
+            dot = ipyl.CircleMarker(
+                
+                location=(lat[0], lon[0]),
+                radius=8,
+                color="black",
+                fill=True,
+                fill_color="green",
+                opacity=0.8,
+                fill_opacity=0.8
+            )
+            dot.added = True
+            m.add_layer(dot)
+
+def clear_added_plot(event):
+
+    to_remove = []
+
+    for layer in m.layers:
+        # keep basemap + the marker we want to keep
+        if isinstance(layer, ipyl.CircleMarker) and layer is not marker and hasattr(layer, "added"):
+            to_remove.append(layer)
+        
+    for layer in to_remove:
+        m.remove_layer(layer)
+
+plot_added.on_click(plot_added_map)
+clear_added.on_click(clear_added_plot)
+
+
+
+
+# -------------- Cleanup -------------
+
+
+def session_destroyed(session_context):
+    cur.close()
+    conn.close()
+
+    try: 
+        m.close()
+    except: 
+        pass
+
+    try:
+        map_pane._widget.close()
+    except:
+        pass
+
+
+    try:
+        for widget in pn.state.cache.values():
+            try:
+                widget.close()
+            except: 
+                pass
+    except:
+        pass
+
+
+    if stream is not None:
+        try:
+            stream.stop()
+            stream.close()
+        except:
+            pass
+
+        stream = None
+
+pn.state.on_session_destroyed(session_destroyed)
 
 # ---------------- UI ----------------
 
@@ -328,16 +496,20 @@ left  = pn.Column("## Video Display",
 
 
 
-
 right = pn.Column("## Live GPS Map",
                   map_pane,
                   "## Add Commentary",
                   pn.Row(record_button, stop_button, save_recording),
                   recording_status,
                   playback,
-                  pn.Row(audio_retrieval, audio_id_input)
+                  pn.Row(audio_retrieval, audio_id_input),
+                  "## Added Audio",
+                  pn.Row(search_add_box, plot_added, clear_added),
+                  new_transcript_df
                   )
 
 pn.Column("# Newburgh Heights Dash GPS Sync",
           pn.Row(left, right)).servable()
+
+
 
