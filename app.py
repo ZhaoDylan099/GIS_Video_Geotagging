@@ -70,7 +70,7 @@ def seconds_to_time(s):
 
 narrative["Media Time"] = narrative["st_time"].apply(seconds_to_time)
 narrative.rename(columns={"text": "Transcript"}, inplace=True)
-narrative["active"] = ""
+narrative["Active"] = ""
     
 
 
@@ -117,7 +117,7 @@ video_pane.param.watch(update_marker, "time")
 #---------------- NARRATIVE ----------------
 
 transcript_table = pn.pane.DataFrame(
-    narrative[["active","Media Time", "Transcript"]],
+    narrative[["Active","Media Time", "Transcript"]],
     height=300, width=700                
 )
 
@@ -133,10 +133,10 @@ def update_transcript(event=None):
 
         index = rows.index[-1]
     df = narrative.copy()
-    df["active"] = ""
+    df["Active"] = ""
 
     if index != -1:
-        df.loc[index, "active"] = "▶ CURRENT"
+        df.loc[index, "Active"] = "▶ CURRENT"
 
     t_input = Search.value.strip().lower()
 
@@ -147,7 +147,7 @@ def update_transcript(event=None):
 
     # Force UI update with a NEW object ref
 
-    transcript_table.object = df[["active", "Media Time", "Transcript"]]
+    transcript_table.object = df[["Active", "Media Time", "Transcript"]]
 
     
 
@@ -238,10 +238,10 @@ def reflect_db():
 
     df = pd.read_sql_query(sql, engine)
 
-    df["Timestamp"] = df["time_s"].apply(seconds_to_time)
+    df["Media Time"] = df["time_s"].apply(seconds_to_time)
     df.rename(columns = {"transcript": "Transcript", "audioid": "ID"}, inplace=True)
 
-    df = df[["ID", "Timestamp", "Transcript"]]
+    df = df[["ID", "Media Time", "Transcript"]]
 
     return df
 
@@ -252,7 +252,7 @@ new_transcript_df = pn.pane.DataFrame(reflect_db(),
 
 stream = None
 
-db_audio = pd.DataFrame(columns=["ID","Timestamp", "Transcript"])
+db_audio = pd.DataFrame(columns=["ID","Media Time", "Transcript"])
 
 def callback(indata, frames, time, status):
     
@@ -406,7 +406,7 @@ def plot_added_map(event):
 
     df = df[df["Transcript"].str.contains(search_add_box.value)]
 
-    df["time_s"] = df["Timestamp"].apply(time_to_seconds)
+    df["time_s"] = df["Media Time"].apply(time_to_seconds)
 
     times = df.time_s.tolist()
 
@@ -444,8 +444,18 @@ def clear_added_plot(event):
 plot_added.on_click(plot_added_map)
 clear_added.on_click(clear_added_plot)
 
+# -------------- Export --------------
+
+export_added = pn.widgets.Button(name="Export Added To CSV", button_type="primary")
+export_message = pn.pane.Markdown(None)
 
 
+def added_to_csv(event):
+    export_message.object = "### Exporting..."
+    new_transcript_df.object.to_csv("added_audio.csv")
+    export_message.object = "### Filed Saved as CSV"
+
+export_added.on_click(added_to_csv)
 
 # -------------- Cleanup -------------
 
@@ -503,7 +513,7 @@ right = pn.Column("## Live GPS Map",
                   recording_status,
                   playback,
                   pn.Row(audio_retrieval, audio_id_input),
-                  "## Added Audio",
+                  pn.Row("## Added Audio", export_added, export_message),
                   pn.Row(search_add_box, plot_added, clear_added),
                   new_transcript_df
                   )
