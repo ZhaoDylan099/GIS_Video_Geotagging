@@ -458,7 +458,12 @@ def clear_added_plot(event):
 plot_added.on_click(plot_added_map)
 clear_added.on_click(clear_added_plot)
 
+export_added = pn.widgets.Button(name="Export Added Data", button_type = "primary")
 
+def export_added_audio(event):
+    new_transcript_df.object.to_csv("added_data.csv")
+
+export_added.on_click(export_added_audio)
 
 # ------------- Embedding ------------
 semantic_status = pn.pane.Markdown("### Semantic search idle", width=400)
@@ -609,7 +614,7 @@ right = pn.Column("## Live GPS Map",
                   playback,
                   pn.Row(audio_retrieval, audio_id_input),
                   "## Added Audio",
-                  pn.Row(search_add_box, plot_added, clear_added),
+                  pn.Row(search_add_box, plot_added, clear_added, export_added),
                   new_transcript_df
                   )
 
