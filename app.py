@@ -6,8 +6,19 @@ import sys
 import numpy as np
 import wavio as wv
 import psycopg2
-import whisper 
+import whisper
+import os
 from sqlalchemy import create_engine
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
+from pgvector.psycopg2 import register_vector
+from gpt4all import GPT4All
+
+llm_model = GPT4All("Meta-Llama-3-8B-Instruct.Q4_0.gguf")
+
+
+model_st = SentenceTransformer("all-MiniLM-L6-v2")
+
 
 VIDEO_URL = "http://localhost/newburgheights_dash_video.mp4"
 CSV_FILE  = "newburgheights_dash_video_gps.csv"
@@ -17,6 +28,7 @@ TIME_COL = "media time"
 LAT_COL  = "latitude"
 LON_COL  = "longitude"
 ZOOM_START = 15
+
 
 
 audio_buffer = []
@@ -31,6 +43,7 @@ print(sd.query_devices())
 # Adjust for your database configurations
 conn = psycopg2.connect("dbname=GIS_Video_Geotagging user=postgres password=123123 host=localhost")
 
+register_vector(conn)
 cur = conn.cursor()
 
 engine = create_engine(
@@ -70,8 +83,9 @@ def seconds_to_time(s):
 
 narrative["Media Time"] = narrative["st_time"].apply(seconds_to_time)
 narrative.rename(columns={"text": "Transcript"}, inplace=True)
-narrative["active"] = ""
+narrative["Active"] = ""
     
+
 
 
 # ---------------- MAP ----------------
@@ -117,8 +131,8 @@ video_pane.param.watch(update_marker, "time")
 #---------------- NARRATIVE ----------------
 
 transcript_table = pn.pane.DataFrame(
-    narrative[["active","Media Time", "Transcript"]],
-    height=300, width=700                
+    narrative[["Active","Media Time", "Transcript"]],
+    height=500, width=700                
 )
 
 
@@ -133,10 +147,10 @@ def update_transcript(event=None):
 
         index = rows.index[-1]
     df = narrative.copy()
-    df["active"] = ""
+    df["Active"] = ""
 
     if index != -1:
-        df.loc[index, "active"] = "▶ CURRENT"
+        df.loc[index, "Active"] = "▶ CURRENT"
 
     t_input = Search.value.strip().lower()
 
@@ -147,7 +161,7 @@ def update_transcript(event=None):
 
     # Force UI update with a NEW object ref
 
-    transcript_table.object = df[["active", "Media Time", "Transcript"]]
+    transcript_table.object = df[["Active", "Media Time", "Transcript"]]
 
     
 
@@ -220,7 +234,6 @@ def clear_search(event):
 clear_plot_button.on_click(clear_search)
 
 # ---------- Audio Recording ---------
-
 
 recording_status = pn.pane.Markdown("### 🔴 **Not Recording**")
 record_button = pn.widgets.Button(name= 'Record', button_type = "primary")
@@ -306,8 +319,8 @@ def transcribe_audio():
 
 def audio_to_db(event):
 
-    sql = """ INSERT INTO recordings (time_s, audio, sample_rate, channels, transcript)  
-    VALUES (%s, %s, %s, %s, %s) 
+    sql = """ INSERT INTO recordings (time_s, audio, sample_rate, channels, transcript, embedding)  
+    VALUES (%s, %s, %s, %s, %s, %s) 
     RETURNING audioID; """
     
 
@@ -319,9 +332,10 @@ def audio_to_db(event):
 
         recording_status.object = "### Saving Recording..."
 
+        result = transcribe_audio()
         cur.execute(
             sql,
-            (round(video_pane.time), psycopg2.Binary(wav_bytes), samplerate, channels, transcribe_audio())
+            (round(video_pane.time), psycopg2.Binary(wav_bytes), samplerate, channels, result, model_st.encode(result))
         )
 
         record_id = cur.fetchone()[0]
@@ -446,6 +460,97 @@ clear_added.on_click(clear_added_plot)
 
 
 
+# ------------- Embedding ------------
+semantic_status = pn.pane.Markdown("### Semantic search idle", width=400)
+embed = input("Has embedding happened? (y/n): ")
+
+if embed == "n":
+    text = narrative["Transcript"].tolist()
+
+    embeddings = model_st.encode(text, normalize_embeddings=True)
+
+    for time_s, text, embedding in zip(narrative["st_time"].to_list(), narrative["Transcript"], embeddings):
+        cur.execute(
+            "INSERT INTO embedding (time_s, transcript, embedding) VALUES (%s, %s, %s)",
+            (time_s, text, embedding.tolist())
+        )
+    conn.commit()
+
+
+# ----------- Semantic Search --------
+query_og = pn.widgets.TextInput(name='Query', placeholder='Query...')
+score_og_df = pn.pane.DataFrame(narrative[["Media Time", "Transcript"]])
+export_scores = pn.widgets.Button(name="Export Search Scores", button_type = "primary")
+
+
+def expand_query(user_query):
+    prompt = f"""
+                    You are helping search inside VIDEO TRANSCRIPTS.
+
+                    Rules:
+                    - DO NOT invent objects, scenes, or visual elements
+                    - DO NOT assume anything not stated
+                    - ONLY add synonyms and closely related phrases
+                    - Stay literal and grounded
+                    - Output ONE short expanded query
+
+                    Original query:
+                    "{user_query}"""
+    
+    response = llm_model.generate(prompt)
+    augmented_query = response.strip()
+
+    return augmented_query
+
+def semantic_search_og(event):
+    semantic_status.object = "### 🔄 Semantic search running..."
+
+    query = query_og.value
+
+
+    expanded_query= expand_query(query)
+    expanded_query_embedding = model_st.encode(expanded_query).tolist()
+
+    threshold = 0.2  # smaller distance = more similar
+    cur.execute("""
+        SELECT audioID, time_s, transcript, embedding <=> %s::vector AS distance
+        FROM embedding
+    
+        ORDER BY distance
+    """, (expanded_query_embedding,))
+
+    
+    rows = cur.fetchall()
+
+    if rows:
+        df = pd.DataFrame(rows, columns=["ID", "time_s", "Transcript", "distance"])
+        df["Timestamp"] = df["time_s"].apply(seconds_to_time)
+        # 1️⃣ Scale distances to 0-1 using min-max
+        min_d = df["distance"].min()
+        max_d = df["distance"].max()
+
+        df["similarity"] = 1 - (df["distance"] - min_d) / (max_d - min_d)  # 0 = worst, 1 = best
+
+        # 2️⃣ Apply sigmoid to exaggerate differences
+        alpha = 10  # controls steepness
+        df["Score"] = 1 / (1 + np.exp(-alpha * (df["similarity"] - 0.5)))  # 0-1
+
+        # 3️⃣ Convert to 0-100
+        df["Score"] = (df["Score"] * 100).round(2)
+        df = df[["ID", "Timestamp", "Transcript", "Score"]]
+                
+    else:
+        df = pd.DataFrame(columns=["ID", "Timestamp", "Transcript", "Score"])
+    score_og_df.object = df
+
+    semantic_status.object = f"### ✅ Semantic search complete"
+
+    
+def export_semantics(event):
+    score_og_df.object.to_csv("semantic_scores.csv")
+
+query_og.param.watch(semantic_search_og, 'value')
+export_scores.on_click(export_semantics)
 
 # -------------- Cleanup -------------
 
@@ -509,7 +614,11 @@ right = pn.Column("## Live GPS Map",
                   )
 
 pn.Column("# Newburgh Heights Dash GPS Sync",
-          pn.Row(left, right)).servable()
+          pn.Row(left, right, sizing_mode="stretch_width"),
+          "## Semantic Search",
+          pn.Row(query_og, export_scores),
+          semantic_status,
+          score_og_df).servable()
 
 
 
