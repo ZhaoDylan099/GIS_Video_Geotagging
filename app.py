@@ -21,11 +21,11 @@ ZOOM_START = 15
 
 audio_buffer = []
 samplerate = 44100
-channels = 1
+channels = 2
 dtype = np.float32
 
 # May differ between devices
-sd.default.device = (1, 2)
+sd.default.device = (1, 3)
 print(sd.query_devices())
 
 # Adjust for your database configurations
