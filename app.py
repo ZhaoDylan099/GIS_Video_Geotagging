@@ -14,7 +14,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 from pgvector.psycopg2 import register_vector
 from gpt4all import GPT4All
 
-llm_model = GPT4All("Meta-Llama-3-8B-Instruct.Q4_0.gguf")
+llm_model = GPT4All("Meta-Llama-3-8B-Instruct.Q4_0.gguf", device = "cuda")
 
 
 model_st = SentenceTransformer("all-MiniLM-L6-v2")
@@ -79,7 +79,7 @@ def seconds_to_time(s):
     h = int(s // 3600)
     m = int((s % 3600) // 60)
     s = s % 60
-    return f"{h:02}:{m:02}:{s:05.2f}"
+    return f"{h}:{m:02}:{s:02}"
 
 narrative["Media Time"] = narrative["st_time"].apply(seconds_to_time)
 narrative.rename(columns={"text": "Transcript"}, inplace=True)
